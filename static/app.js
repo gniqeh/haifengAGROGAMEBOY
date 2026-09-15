@@ -1,7 +1,15 @@
+function makeDeviceId() {
+  if (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function') {
+    return globalThis.crypto.randomUUID();
+  }
+  const rand = Math.random().toString(36).slice(2);
+  return `dev-${Date.now().toString(36)}-${rand}`;
+}
+
 const deviceId = (() => {
   let id = localStorage.getItem('agro_device_id');
   if (!id) {
-    id = crypto.randomUUID();
+    id = makeDeviceId();
     localStorage.setItem('agro_device_id', id);
   }
   return id;
