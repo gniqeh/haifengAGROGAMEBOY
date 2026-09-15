@@ -1,158 +1,25 @@
-function makeDeviceId() {
-  if (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function') {
-    return globalThis.crypto.randomUUID();
-  }
-  const rand = Math.random().toString(36).slice(2);
-  return `dev-${Date.now().toString(36)}-${rand}`;
-}
-
-const deviceId = (() => {
-  let id = localStorage.getItem('agro_device_id');
-  if (!id) {
-    id = makeDeviceId();
-    localStorage.setItem('agro_device_id', id);
-  }
-  return id;
-})();
-
-let currentState = null;
-let currentVote = null;
-let socket = null;
-let reconnectTimer = null;
-
-const $ = (id) => document.getElementById(id);
-const waitingView = $('waitingView');
-const questionView = $('questionView');
-const finishedView = $('finishedView');
-const connection = $('connection');
-
-async function registerDevice() {
-  await fetch('/api/register', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({device_id: deviceId})
-  });
-}
-
-async function loadMyVote() {
-  const r = await fetch(`/api/my-vote/${encodeURIComponent(deviceId)}`);
-  const data = await r.json();
-  currentVote = data.answer_index;
-}
-
-function setConnection(ok) {
-  connection.textContent = ok ? '已连接' : '连接中';
-  connection.classList.toggle('online', ok);
-}
-
-function connectWs() {
-  clearTimeout(reconnectTimer);
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  socket = new WebSocket(`${proto}://${location.host}/ws/participant/${encodeURIComponent(deviceId)}`);
-  socket.onopen = () => setConnection(true);
-  socket.onclose = () => {
-    setConnection(false);
-    reconnectTimer = setTimeout(connectWs, 1200);
-  };
-  socket.onerror = () => socket.close();
-  socket.onmessage = async (ev) => {
-    const msg = JSON.parse(ev.data);
-    if (msg.type === 'state') {
-      const oldQ = currentState?.question?.id;
-      currentState = msg.data;
-      const newQ = currentState?.question?.id;
-      if (oldQ !== newQ) await loadMyVote();
-      render();
-    }
-  };
-}
-
-function showOnly(view) {
-  [waitingView, questionView, finishedView].forEach(v => v.classList.add('hidden'));
-  view.classList.remove('hidden');
-}
-
-function render() {
-  if (!currentState || currentState.status === 'waiting') {
-    showOnly(waitingView);
-    return;
-  }
-  if (currentState.status === 'finished') {
-    showOnly(finishedView);
-    return;
-  }
-  const q = currentState.question;
-  if (!q) {
-    showOnly(waitingView);
-    return;
-  }
-  showOnly(questionView);
-  $('progress').textContent = `第 ${currentState.current_question + 1} / ${currentState.total_questions} 题`;
-  $('questionTitle').textContent = q.title;
-  $('questionSubtitle').textContent = q.subtitle || '';
-
-  const options = $('options');
-  options.innerHTML = '';
-  q.options.forEach((label, i) => {
-    const btn = document.createElement('button');
-    btn.className = 'option-btn' + (currentVote === i ? ' selected' : '');
-    btn.innerHTML = `<span class="option-prefix">${String.fromCharCode(65 + i)}</span>${escapeHtml(label)}`;
-    btn.onclick = () => submitVote(i);
-    options.appendChild(btn);
-  });
-
-  $('saveState').textContent = currentVote === null ? '选择会自动保存' : '已保存，可修改';
-  const panel = $('resultPanel');
-  panel.classList.toggle('hidden', !currentState.revealed);
-  if (currentState.revealed) renderResults();
-}
-
-async function submitVote(index) {
-  currentVote = index;
-  render();
-  $('saveState').textContent = '保存中…';
-  try {
-    const r = await fetch('/api/vote', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({device_id: deviceId, answer_index: index})
-    });
-    if (!r.ok) throw new Error('vote failed');
-    $('saveState').textContent = '已保存，可修改';
-  } catch (e) {
-    $('saveState').textContent = '保存失败，请再点一次';
-  }
-}
-
-function renderResults() {
-  const q = currentState.question;
-  const total = currentState.counts.reduce((a,b) => a+b, 0);
-  const bars = $('bars');
-  bars.innerHTML = '';
-  q.options.forEach((label, i) => {
-    const count = currentState.counts[i] || 0;
-    const pct = total ? Math.round(count * 100 / total) : 0;
-    const row = document.createElement('div');
-    row.className = 'bar-row';
-    row.innerHTML = `<div class="bar-label">${escapeHtml(label)}</div><div class="bar-track"><div class="bar-fill" style="width:${pct}%"></div></div><div class="bar-value">${count} · ${pct}%</div>`;
-    bars.appendChild(row);
-  });
-  const ai = $('aiPanel');
-  const hasAI = q.ai_label || q.ai_reason;
-  ai.classList.toggle('hidden', !hasAI);
-  $('aiLabel').textContent = q.ai_label || '';
-  $('aiReason').textContent = q.ai_reason || '';
-}
-
-function escapeHtml(s) {
-  return String(s).replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
-}
-
-(async function init(){
-  await registerDevice();
-  const state = await fetch('/api/state').then(r => r.json());
-  currentState = state;
-  await loadMyVote();
-  render();
-  connectWs();
-})();
+const gid=()=>{let x=localStorage.getItem('agro_device_id');if(!x){x=(crypto.randomUUID?crypto.randomUUID():('dev-'+Date.now()+'-'+Math.random().toString(16).slice(2)));localStorage.setItem('agro_device_id',x)}return x};
+const deviceId=gid();let S=null, selected=0;
+const stageOrder=['survey','allocate','ai','event','result'];
+const stageNames={survey:'巡田',allocate:'资源配置',ai:'AI协同',event:'突发事件',result:'经营结果'};
+function q(x){return document.getElementById(x)}
+async function api(url,opt={}){const r=await fetch(url,opt);if(!r.ok)throw new Error(await r.text());return r.json()}
+async function boot(){const r=await api('/api/register',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({device_id:deviceId})});S=r.state;selected=S.selected_zone||0;render();connectWs()}
+function connectWs(){const p=location.protocol==='https:'?'wss':'ws';const ws=new WebSocket(`${p}://${location.host}/ws/participant/${deviceId}`);ws.onclose=()=>setTimeout(connectWs,1200)}
+function render(){const sc=S.scenario;q('farmName').textContent=`${sc.name} · ${sc.crop} · ${sc.stage}`;q('stageTag').textContent=stageNames[S.stage];q('progressText').textContent=`${stageOrder.indexOf(S.stage)+1} / ${stageOrder.length}  ${stageNames[S.stage]}`;renderField();renderSide();renderFooter()}
+function renderField(){const sc=S.scenario, f=q('field');f.innerHTML='';sc.zones.forEach((z,i)=>{const d=document.createElement('button');d.className='zone '+(selected===i?'sel':'');const dryness=Math.max(0,60-z.moisture);d.style.setProperty('--stress',`${dryness}%`);d.innerHTML=`<span class="zone-name">${z.name}</span><span class="zone-ndvi">NDVI ${z.ndvi.toFixed(2)}</span><span class="zone-risk">风险 ${z.risk}%</span>`;d.onclick=()=>{selected=i;S.selected_zone=i;render()};f.appendChild(d)});q('hint').textContent=S.stage==='survey'?'点击不同田块查看农情差异':'田块状态与当前决策联动显示'}
+function metricsHtml(z){return `<div class="metric"><span>土壤水分</span><b>${z.moisture}%</b></div><div class="metric"><span>NDVI</span><b>${z.ndvi.toFixed(2)}</b></div><div class="metric"><span>风险指数</span><b>${z.risk}%</b></div><p class="note">${z.note}</p>`}
+function renderSide(){const sc=S.scenario,z=sc.zones[selected];q('metrics').innerHTML=metricsHtml(z);const rw=sc.resources.water-sum(S.water),rf=sc.resources.fert-sum(S.fert);q('resourceSummary').innerHTML=`<div class="resource"><span>灌溉水</span><b>${rw}</b><small>/ ${sc.resources.water}</small></div><div class="resource"><span>肥料</span><b>${rf}</b><small>/ ${sc.resources.fert}</small></div><p class="weather">${sc.weather}</p>`;const a=q('actionPanel');if(S.stage==='survey')a.innerHTML=`<h3>巡田提示</h3><p>四个区域状态不同。点一遍田块，先形成自己的判断。</p>`;if(S.stage==='allocate')a.innerHTML=allocHtml(selected);if(S.stage==='ai')a.innerHTML=aiHtml();if(S.stage==='event')a.innerHTML=eventHtml();if(S.stage==='result')a.innerHTML=resultHtml();bindActions()}
+function allocHtml(i){const sc=S.scenario;return `<h3>${sc.zones[i].name} · 投入</h3><label>灌溉 <b id="wv">${S.water[i]}</b><input id="waterRange" type="range" min="0" max="${sc.resources.water}" value="${S.water[i]}"></label><label>施肥 <b id="fv">${S.fert[i]}</b><input id="fertRange" type="range" min="0" max="${sc.resources.fert}" value="${S.fert[i]}"></label><button class="ghost" id="clearZone">清空本区</button><p class="note">资源有限。你给这里多一点，别处就得少一点。</p>`}
+function aiHtml(){const ai=S.scenario.ai;return `<h3>AI方案已生成</h3><div class="compare"><div><span>你的灌溉</span><b>${S.water.join(' / ')}</b><span>AI灌溉</span><b>${ai.water.join(' / ')}</b></div><div><span>你的施肥</span><b>${S.fert.join(' / ')}</b><span>AI施肥</span><b>${ai.fert.join(' / ')}</b></div></div><p>${ai.reason}</p><div class="choice3"><button data-ai="keep">保留我的方案</button><button data-ai="adopt">采用AI方案</button><button data-ai="adjust">参考AI再调整</button></div>`}
+function eventHtml(){const e=S.scenario.event;return `<h3 class="warning">⚠ ${e.title}</h3><p>${e.detail}</p><div class="event-actions">${e.actions.map(x=>`<button data-event="${x}">${x}</button>`).join('')}</div>`}
+function resultHtml(){return `<h3>经营结果</h3><div class="score">${S.score?.toFixed(1)||'--'}</div><div class="result-grid"><div><span>预计产量</span><b>${S.yield} kg/亩</b></div><div><span>预计收益</span><b>${S.profit} 元/亩</b></div><div><span>资源效率</span><b>${S.efficiency}</b></div><div><span>风险指数</span><b>${S.risk}</b></div></div><p class="note">这是模拟评分，不是标准答案。重点在于你如何使用信息、资源和AI建议。</p>`}
+function bindActions(){const wr=q('waterRange'),fr=q('fertRange');if(wr){wr.oninput=()=>setRes('water',+wr.value);fr.oninput=()=>setRes('fert',+fr.value);q('clearZone').onclick=()=>{S.water[selected]=0;S.fert[selected]=0;renderSide()}}document.querySelectorAll('[data-ai]').forEach(b=>b.onclick=()=>chooseAI(b.dataset.ai));document.querySelectorAll('[data-event]').forEach(b=>b.onclick=()=>{S.event_action=b.dataset.event;document.querySelectorAll('[data-event]').forEach(x=>x.classList.toggle('active',x===b))})}
+function setRes(kind,val){const arr=[...S[kind]],limit=S.scenario.resources[kind],others=sum(arr)-arr[selected];arr[selected]=Math.max(0,Math.min(val,limit-others));S[kind]=arr;renderSide()}
+function chooseAI(mode){S.ai_mode=mode;if(mode==='adopt'){S.water=[...S.scenario.ai.water];S.fert=[...S.scenario.ai.fert]}document.querySelectorAll('[data-ai]').forEach(x=>x.classList.toggle('active',x.dataset.ai===mode))}
+function renderFooter(){const b=q('nextBtn');if(S.stage==='survey')b.textContent='进入资源配置';if(S.stage==='allocate')b.textContent='提交方案 · 让AI分析';if(S.stage==='ai')b.textContent='确认决策 · 推进一天';if(S.stage==='event')b.textContent='执行处置 · 模拟至成熟';if(S.stage==='result')b.textContent='本轮已完成';b.disabled=S.stage==='result';b.onclick=nextStage}
+async function nextStage(){let next;if(S.stage==='survey')next='allocate';else if(S.stage==='allocate')next='ai';else if(S.stage==='ai'){if(!S.ai_mode){flash('请先选择如何处理AI建议');return}next='event'}else if(S.stage==='event'){if(!S.event_action){flash('先选择一个处置动作');return}next='result'}else return;S.stage=next;await save();render()}
+async function save(){const p={stage:S.stage,selected_zone:selected,water:S.water,fert:S.fert,ai_mode:S.ai_mode,event_action:S.event_action};const r=await api(`/api/game/${deviceId}/save`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});S=r.state}
+function sum(a){return a.reduce((x,y)=>x+y,0)}
+function flash(t){q('hint').textContent=t;q('hint').classList.add('flash');setTimeout(()=>q('hint').classList.remove('flash'),1200)}
+boot().catch(e=>{document.body.innerHTML=`<pre style="padding:30px">启动失败\n${e}</pre>`})
