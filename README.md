@@ -10,7 +10,7 @@ cd haifengAGROGAMEBOY
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-./start.sh
+bash start.sh
 ```
 
 默认监听 `0.0.0.0:8830`。
@@ -22,15 +22,23 @@ pip install -r requirements.txt
 如需改端口：
 
 ```bash
-PORT=8835 ./start.sh
+PORT=8835 bash start.sh
 ```
 
 可使用 8830~8839 中任意空闲端口。
 
+如果 Debian 提示无法创建 venv：
+
+```bash
+sudo apt update
+sudo apt install -y python3-venv
+```
+
 ## 功能
 
 - 触摸屏友好的大按钮参与端
-- 浏览器本地 UUID + IP 双重记录终端
+- 浏览器本地设备 ID + IP 双重记录终端
+- 普通 HTTP 局域网环境可用，不依赖 HTTPS 才能生成设备编号
 - SQLite 自动建库，无需额外数据库
 - WebSocket 实时同步主持人控制与参与端状态
 - 主持后台查看在线终端、答题进度和实时统计
