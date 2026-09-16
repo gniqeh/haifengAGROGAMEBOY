@@ -141,7 +141,7 @@ def require_admin(request: Request):
 def home():
     game = get_active_game()
     html = (STATIC_DIR / GAMES[game]["file"]).read_text(encoding="utf-8")
-    marker = f'<script>window.__ACTIVE_GAME__={json.dumps(game)};</script><script src="/static/tracking.js"></script><script src="/static/mode-watch.js"></script>'
+    marker = f'<script>window.__ACTIVE_GAME__={json.dumps(game)};</script><script src="/static/run-state.js"></script><script src="/static/mode-watch.js"></script>'
     html = html.replace("</body>", marker + "</body>")
     return HTMLResponse(html, headers={"Cache-Control": "no-store"})
 
