@@ -5,11 +5,10 @@ import json
 import secrets
 import sqlite3
 from pathlib import Path
-from typing import Optional
 
 import uvicorn
-from fastapi import FastAPI, Form, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -19,13 +18,21 @@ ADMIN_PASSWORD = "hfgdmm"
 SESSION_COOKIE = "agro_admin_session"
 admin_sessions = set()
 
-app = FastAPI(title="农业知识答题闯关")
+GAMES = {
+    "quiz1": {"name": "农业知识答题闯关", "file": "index.html"},
+    "quiz2": {"name": "智慧农业闯关", "file": "smart-farm-quiz.html"},
+}
+DEFAULT_GAME = "quiz1"
+
+app = FastAPI(title="农业互动展示")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
 
 def db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
 
 def init_db():
     with db() as c:
@@ -46,10 +53,40 @@ def init_db():
         """)
         c.execute("CREATE INDEX IF NOT EXISTS idx_results_ip ON quiz_results(ip)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_results_time ON quiz_results(submitted_at)")
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS app_settings(
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """)
+        c.execute(
+            "INSERT OR IGNORE INTO app_settings(key,value) VALUES('active_game',?)",
+            (DEFAULT_GAME,),
+        )
+
 
 @app.on_event("startup")
 def startup():
     init_db()
+
+
+def get_active_game() -> str:
+    with db() as c:
+        row = c.execute("SELECT value FROM app_settings WHERE key='active_game'").fetchone()
+    value = row["value"] if row else DEFAULT_GAME
+    return value if value in GAMES else DEFAULT_GAME
+
+
+def set_active_game(game: str):
+    if game not in GAMES:
+        raise HTTPException(status_code=400, detail="unknown game")
+    with db() as c:
+        c.execute(
+            "INSERT INTO app_settings(key,value) VALUES('active_game',?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (game,),
+        )
+
 
 def client_ip(request: Request) -> str:
     xff = request.headers.get("x-forwarded-for")
@@ -60,18 +97,23 @@ def client_ip(request: Request) -> str:
         return xr.strip()[:64]
     return (request.client.host if request.client else "unknown")[:64]
 
+
 def require_admin(request: Request):
     token = request.cookies.get(SESSION_COOKIE)
     if not token or token not in admin_sessions:
         raise HTTPException(status_code=401, detail="unauthorized")
 
+
 @app.get("/")
 def home():
-    return FileResponse(STATIC_DIR / "index.html")
+    game = get_active_game()
+    return FileResponse(STATIC_DIR / GAMES[game]["file"])
+
 
 @app.get("/admin")
 def admin_page():
     return FileResponse(STATIC_DIR / "admin.html")
+
 
 @app.post("/api/results")
 async def save_result(request: Request):
@@ -100,6 +142,7 @@ async def save_result(request: Request):
         ))
     return {"ok": True}
 
+
 @app.post("/api/admin/login")
 async def admin_login(request: Request):
     data = await request.json()
@@ -111,6 +154,7 @@ async def admin_login(request: Request):
     resp.set_cookie(SESSION_COOKIE, token, httponly=True, samesite="strict", max_age=86400)
     return resp
 
+
 @app.post("/api/admin/logout")
 def admin_logout(request: Request):
     token = request.cookies.get(SESSION_COOKIE)
@@ -120,9 +164,11 @@ def admin_logout(request: Request):
     resp.delete_cookie(SESSION_COOKIE)
     return resp
 
+
 @app.get("/api/admin/dashboard")
 def dashboard(request: Request):
     require_admin(request)
+    active_game = get_active_game()
     with db() as c:
         s = c.execute("""SELECT COUNT(*) AS total_runs, COUNT(DISTINCT ip) AS unique_ips,
           ROUND(AVG(score),1) AS avg_score, ROUND(AVG(rate),1) AS avg_rate,
@@ -130,7 +176,22 @@ def dashboard(request: Request):
           FROM quiz_results""").fetchone()
         rows = c.execute("""SELECT id,submitted_at,ip,score,right_count,total,rate,grade,user_agent,session_id
           FROM quiz_results ORDER BY id DESC LIMIT 500""").fetchall()
-    return {"summary": dict(s), "results": [dict(r) for r in rows]}
+    return {
+        "summary": dict(s),
+        "results": [dict(r) for r in rows],
+        "active_game": active_game,
+        "games": [{"id": gid, "name": meta["name"]} for gid, meta in GAMES.items()],
+    }
+
+
+@app.post("/api/admin/active-game")
+async def change_active_game(request: Request):
+    require_admin(request)
+    data = await request.json()
+    game = str(data.get("game", ""))
+    set_active_game(game)
+    return {"ok": True, "active_game": game, "name": GAMES[game]["name"]}
+
 
 @app.get("/api/admin/result/{result_id}")
 def result_detail(result_id: int, request: Request):
@@ -147,6 +208,7 @@ def result_detail(result_id: int, request: Request):
         d.pop("answers_json", None)
     return d
 
+
 @app.get("/api/admin/export.csv")
 def export_csv(request: Request):
     require_admin(request)
@@ -161,12 +223,14 @@ def export_csv(request: Request):
     data = '\ufeff' + buf.getvalue()
     return Response(data, media_type="text/csv; charset=utf-8", headers={"Content-Disposition":"attachment; filename=quiz_results.csv"})
 
+
 def main():
-    p = argparse.ArgumentParser(description="农业知识答题闯关服务器")
+    p = argparse.ArgumentParser(description="农业互动展示服务器")
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8831)
     args = p.parse_args()
     uvicorn.run(app, host=args.host, port=args.port)
+
 
 if __name__ == "__main__":
     main()
