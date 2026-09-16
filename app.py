@@ -1,178 +1,172 @@
+import argparse
+import csv
+import io
 import json
-import random
+import secrets
 import sqlite3
 from pathlib import Path
-from typing import Set
+from typing import Optional
 
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
+import uvicorn
+from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "agrogameboy.db"
 STATIC_DIR = BASE_DIR / "static"
-SCENARIOS_PATH = BASE_DIR / "scenarios.json"
+DB_PATH = BASE_DIR / "quiz_results.db"
+ADMIN_PASSWORD = "hfgdmm"
+SESSION_COOKIE = "agro_admin_session"
+admin_sessions = set()
 
-app = FastAPI(title="AGRO GAMEBOY")
+app = FastAPI(title="农业知识答题闯关")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-admins: Set[WebSocket] = set()
-participants: Set[WebSocket] = set()
-
 
 def db():
-    c = sqlite3.connect(DB_PATH)
-    c.row_factory = sqlite3.Row
-    return c
-
-
-def scenarios():
-    return json.loads(SCENARIOS_PATH.read_text(encoding="utf-8"))
-
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 def init_db():
     with db() as c:
-        c.executescript("""
-        CREATE TABLE IF NOT EXISTS devices(
-          device_id TEXT PRIMARY KEY, ip TEXT, first_seen TEXT DEFAULT CURRENT_TIMESTAMP,
-          last_seen TEXT DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS runs(
-          device_id TEXT PRIMARY KEY, scenario_id INTEGER NOT NULL, stage TEXT NOT NULL DEFAULT 'survey',
-          selected_zone INTEGER DEFAULT 0, water_json TEXT NOT NULL DEFAULT '[0,0,0,0]',
-          fert_json TEXT NOT NULL DEFAULT '[0,0,0,0]', ai_mode TEXT DEFAULT '', event_action TEXT DEFAULT '',
-          score REAL, yield_value REAL, profit REAL, efficiency REAL, risk REAL,
-          updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-        );
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS quiz_results(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT,
+            ip TEXT NOT NULL,
+            user_agent TEXT,
+            score INTEGER NOT NULL,
+            right_count INTEGER NOT NULL,
+            total INTEGER NOT NULL,
+            rate INTEGER NOT NULL,
+            grade TEXT,
+            answers_json TEXT NOT NULL DEFAULT '[]',
+            submitted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
         """)
-
+        c.execute("CREATE INDEX IF NOT EXISTS idx_results_ip ON quiz_results(ip)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_results_time ON quiz_results(submitted_at)")
 
 @app.on_event("startup")
 def startup():
     init_db()
 
+def client_ip(request: Request) -> str:
+    xff = request.headers.get("x-forwarded-for")
+    if xff:
+        return xff.split(",")[0].strip()[:64]
+    xr = request.headers.get("x-real-ip")
+    if xr:
+        return xr.strip()[:64]
+    return (request.client.host if request.client else "unknown")[:64]
 
-def ensure_run(device_id: str):
-    ss = scenarios()
-    with db() as c:
-        row = c.execute("SELECT * FROM runs WHERE device_id=?", (device_id,)).fetchone()
-        if not row:
-            sid = (abs(hash(device_id)) % len(ss)) + 1
-            c.execute("INSERT INTO runs(device_id,scenario_id) VALUES(?,?)", (device_id, sid))
-            row = c.execute("SELECT * FROM runs WHERE device_id=?", (device_id,)).fetchone()
-    return row
-
-
-def run_payload(device_id: str):
-    row = ensure_run(device_id)
-    sc = next(s for s in scenarios() if s["id"] == row["scenario_id"])
-    return {
-        "device_id": device_id,
-        "stage": row["stage"],
-        "selected_zone": row["selected_zone"],
-        "water": json.loads(row["water_json"]),
-        "fert": json.loads(row["fert_json"]),
-        "ai_mode": row["ai_mode"],
-        "event_action": row["event_action"],
-        "score": row["score"], "yield": row["yield_value"], "profit": row["profit"],
-        "efficiency": row["efficiency"], "risk": row["risk"],
-        "scenario": sc,
-    }
-
-
-def calc_result(sc, water, fert, ai_mode, event_action):
-    water_err = sum(abs(a-b) for a,b in zip(water, sc["ai"]["water"]))
-    fert_err = sum(abs(a-b) for a,b in zip(fert, sc["ai"]["fert"]))
-    resource_fit = max(0, 100 - water_err*0.55 - fert_err*0.7)
-    event_scores = sc["event"]["scores"]
-    event_score = event_scores.get(event_action, 40)
-    ai_bonus = {"keep": 0, "adopt": 5, "adjust": 3}.get(ai_mode, 0)
-    score = max(0, min(100, resource_fit*0.58 + event_score*0.34 + ai_bonus + 7))
-    yield_value = round(sc["base_yield"] * (0.82 + score/500), 1)
-    efficiency = round(max(40, min(99, 62 + resource_fit*0.34)), 1)
-    risk = round(max(4, min(70, 62 - event_score*0.5 - score*0.12)), 1)
-    profit = round(yield_value * sc["price"] - sc["base_cost"] - sum(water)*0.55 - sum(fert)*1.25, 0)
-    return round(score,1), yield_value, profit, efficiency, risk
-
-
-async def broadcast_admin():
-    payload = {"type":"dashboard"}
-    dead=[]
-    for ws in list(admins):
-        try: await ws.send_json(payload)
-        except Exception: dead.append(ws)
-    for ws in dead: admins.discard(ws)
-
+def require_admin(request: Request):
+    token = request.cookies.get(SESSION_COOKIE)
+    if not token or token not in admin_sessions:
+        raise HTTPException(status_code=401, detail="unauthorized")
 
 @app.get("/")
-def home(): return FileResponse(STATIC_DIR / "index.html")
+def home():
+    return FileResponse(STATIC_DIR / "index.html")
 
 @app.get("/admin")
-def admin_page(): return FileResponse(STATIC_DIR / "admin.html")
+def admin_page():
+    return FileResponse(STATIC_DIR / "admin.html")
 
-@app.post("/api/register")
-async def register(request: Request):
-    data = await request.json(); did = str(data.get("device_id","")).strip()
-    if not did: return JSONResponse({"error":"missing device_id"},400)
-    ip = request.client.host if request.client else ""
+@app.post("/api/results")
+async def save_result(request: Request):
+    data = await request.json()
+    try:
+        score = int(data.get("score", 0))
+        right = int(data.get("right_count", 0))
+        total = int(data.get("total", 0))
+        rate = int(data.get("rate", 0))
+    except (TypeError, ValueError):
+        return JSONResponse({"error": "bad numeric fields"}, status_code=400)
+    if total <= 0 or total > 100 or right < 0 or right > total or score < 0 or score > 100 or rate < 0 or rate > 100:
+        return JSONResponse({"error": "bad result"}, status_code=400)
+    answers = data.get("answers", [])
+    if not isinstance(answers, list):
+        answers = []
+    answers_json = json.dumps(answers[:100], ensure_ascii=False)[:50000]
     with db() as c:
-        c.execute("""INSERT INTO devices(device_id,ip) VALUES(?,?)
-        ON CONFLICT(device_id) DO UPDATE SET ip=excluded.ip,last_seen=CURRENT_TIMESTAMP""", (did,ip))
-    ensure_run(did)
-    await broadcast_admin()
-    return {"ok":True, "state":run_payload(did)}
+        c.execute("""INSERT INTO quiz_results
+          (session_id,ip,user_agent,score,right_count,total,rate,grade,answers_json)
+          VALUES(?,?,?,?,?,?,?,?,?)""", (
+            str(data.get("session_id", ""))[:128],
+            client_ip(request),
+            request.headers.get("user-agent", "")[:500],
+            score, right, total, rate, str(data.get("grade", ""))[:100], answers_json
+        ))
+    return {"ok": True}
 
-@app.get("/api/game/{device_id}")
-def game(device_id: str): return run_payload(device_id)
+@app.post("/api/admin/login")
+async def admin_login(request: Request):
+    data = await request.json()
+    if str(data.get("password", "")) != ADMIN_PASSWORD:
+        return JSONResponse({"ok": False, "error": "密码错误"}, status_code=401)
+    token = secrets.token_urlsafe(32)
+    admin_sessions.add(token)
+    resp = JSONResponse({"ok": True})
+    resp.set_cookie(SESSION_COOKIE, token, httponly=True, samesite="strict", max_age=86400)
+    return resp
 
-@app.post("/api/game/{device_id}/save")
-async def save_game(device_id: str, request: Request):
-    data = await request.json(); state = run_payload(device_id); sc = state["scenario"]
-    stage = data.get("stage", state["stage"])
-    zone = int(data.get("selected_zone", state["selected_zone"]))
-    water = data.get("water", state["water"]); fert = data.get("fert", state["fert"])
-    ai_mode = data.get("ai_mode", state["ai_mode"]); event_action = data.get("event_action", state["event_action"])
-    if len(water)!=4 or len(fert)!=4: return JSONResponse({"error":"bad resource vector"},400)
-    if sum(water) > sc["resources"]["water"] or sum(fert) > sc["resources"]["fert"]:
-        return JSONResponse({"error":"resource exceeded"},400)
-    result=(None,None,None,None,None)
-    if stage == "result": result = calc_result(sc, water, fert, ai_mode, event_action)
-    with db() as c:
-        c.execute("""UPDATE runs SET stage=?,selected_zone=?,water_json=?,fert_json=?,ai_mode=?,event_action=?,
-        score=?,yield_value=?,profit=?,efficiency=?,risk=?,updated_at=CURRENT_TIMESTAMP WHERE device_id=?""",
-        (stage,zone,json.dumps(water),json.dumps(fert),ai_mode,event_action,*result,device_id))
-    await broadcast_admin()
-    return {"ok":True,"state":run_payload(device_id)}
+@app.post("/api/admin/logout")
+def admin_logout(request: Request):
+    token = request.cookies.get(SESSION_COOKIE)
+    if token:
+        admin_sessions.discard(token)
+    resp = JSONResponse({"ok": True})
+    resp.delete_cookie(SESSION_COOKIE)
+    return resp
 
 @app.get("/api/admin/dashboard")
-def dashboard():
+def dashboard(request: Request):
+    require_admin(request)
     with db() as c:
-        rows=c.execute("""SELECT d.device_id,d.ip,d.first_seen,d.last_seen,r.stage,r.scenario_id,r.score,r.profit
-        FROM devices d LEFT JOIN runs r ON d.device_id=r.device_id ORDER BY d.first_seen""").fetchall()
-    items=[dict(r) for r in rows]
-    done=[x for x in items if x.get("stage")=="result" and x.get("score") is not None]
-    return {"online":len(participants),"total":len(items),"done":len(done),"devices":items,
-            "avg_score":round(sum(x["score"] for x in done)/len(done),1) if done else None,
-            "avg_profit":round(sum(x["profit"] for x in done)/len(done),0) if done else None}
+        s = c.execute("""SELECT COUNT(*) AS total_runs, COUNT(DISTINCT ip) AS unique_ips,
+          ROUND(AVG(score),1) AS avg_score, ROUND(AVG(rate),1) AS avg_rate,
+          SUM(CASE WHEN rate=100 THEN 1 ELSE 0 END) AS perfect_runs
+          FROM quiz_results""").fetchone()
+        rows = c.execute("""SELECT id,submitted_at,ip,score,right_count,total,rate,grade,user_agent,session_id
+          FROM quiz_results ORDER BY id DESC LIMIT 500""").fetchall()
+    return {"summary": dict(s), "results": [dict(r) for r in rows]}
 
-@app.post("/api/admin/reset")
-async def reset_all():
+@app.get("/api/admin/result/{result_id}")
+def result_detail(result_id: int, request: Request):
+    require_admin(request)
     with db() as c:
-        c.execute("DELETE FROM runs"); c.execute("DELETE FROM devices")
-    await broadcast_admin(); return {"ok":True}
-
-@app.websocket("/ws/admin")
-async def ws_admin(ws: WebSocket):
-    await ws.accept(); admins.add(ws)
+        row = c.execute("SELECT * FROM quiz_results WHERE id=?", (result_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="not found")
+    d = dict(row)
     try:
-        while True: await ws.receive_text()
-    except WebSocketDisconnect: pass
-    finally: admins.discard(ws)
+        d["answers"] = json.loads(d.pop("answers_json"))
+    except Exception:
+        d["answers"] = []
+        d.pop("answers_json", None)
+    return d
 
-@app.websocket("/ws/participant/{device_id}")
-async def ws_participant(ws: WebSocket, device_id: str):
-    await ws.accept(); participants.add(ws); await broadcast_admin()
-    try:
-        while True: await ws.receive_text()
-    except WebSocketDisconnect: pass
-    finally:
-        participants.discard(ws); await broadcast_admin()
+@app.get("/api/admin/export.csv")
+def export_csv(request: Request):
+    require_admin(request)
+    with db() as c:
+        rows = c.execute("""SELECT id,submitted_at,ip,score,right_count,total,rate,grade,user_agent,session_id
+          FROM quiz_results ORDER BY id DESC""").fetchall()
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["ID","提交时间","IP","得分","答对","总题数","正确率","等级","User-Agent","Session ID"])
+    for r in rows:
+        w.writerow(list(r))
+    data = '\ufeff' + buf.getvalue()
+    return Response(data, media_type="text/csv; charset=utf-8", headers={"Content-Disposition":"attachment; filename=quiz_results.csv"})
+
+def main():
+    p = argparse.ArgumentParser(description="农业知识答题闯关服务器")
+    p.add_argument("--host", default="0.0.0.0")
+    p.add_argument("--port", type=int, default=8831)
+    args = p.parse_args()
+    uvicorn.run(app, host=args.host, port=args.port)
+
+if __name__ == "__main__":
+    main()
