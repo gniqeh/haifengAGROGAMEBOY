@@ -8,7 +8,7 @@ from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -107,7 +107,16 @@ def require_admin(request: Request):
 @app.get("/")
 def home():
     game = get_active_game()
-    return FileResponse(STATIC_DIR / GAMES[game]["file"])
+    html = (STATIC_DIR / GAMES[game]["file"]).read_text(encoding="utf-8")
+    marker = f'<script>window.__ACTIVE_GAME__={json.dumps(game)};</script><script src="/static/mode-watch.js"></script>'
+    html = html.replace("</body>", marker + "</body>")
+    return HTMLResponse(html, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/active-game")
+def public_active_game():
+    game = get_active_game()
+    return {"active_game": game, "name": GAMES[game]["name"]}
 
 
 @app.get("/admin")
