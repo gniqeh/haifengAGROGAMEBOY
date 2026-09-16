@@ -207,30 +207,11 @@ async def update_run(request: Request):
 
 @app.post("/api/results")
 async def save_result(request: Request):
-    data = await request.json()
     try:
-        score = int(data.get("score", 0))
-        right = int(data.get("right_count", 0))
-        total = int(data.get("total", 0))
-        rate = int(data.get("rate", 0))
-    except (TypeError, ValueError):
-        return JSONResponse({"error": "bad numeric fields"}, status_code=400)
-    if total <= 0 or total > 100 or right < 0 or right > total or score < 0 or score > 100 or rate < 0 or rate > 100:
-        return JSONResponse({"error": "bad result"}, status_code=400)
-    answers = data.get("answers", [])
-    if not isinstance(answers, list):
-        answers = []
-    answers_json = json.dumps(answers[:100], ensure_ascii=False)[:50000]
-    with db() as c:
-        c.execute("""INSERT INTO quiz_results
-          (session_id,ip,user_agent,score,right_count,total,rate,grade,answers_json)
-          VALUES(?,?,?,?,?,?,?,?,?)""", (
-            str(data.get("session_id", ""))[:128],
-            client_ip(request),
-            request.headers.get("user-agent", "")[:500],
-            score, right, total, rate, str(data.get("grade", ""))[:100], answers_json
-        ))
-    return {"ok": True}
+        await request.json()
+    except Exception:
+        pass
+    return {"ok": True, "legacy": True}
 
 
 @app.post("/api/admin/login")
